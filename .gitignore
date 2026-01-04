@@ -1,2 +1,9 @@
-"*.bmp" 
-"__pycache__/" 
+# data 폴더 안의 모든 파일 제외
+data/
+
+# 혹은 모든 .bmp 파일 제외
+*.bmp
+*.BMP
+
+# 결과물 폴더 제외 (선택 사항)
+output/
