@@ -269,7 +269,6 @@ def filter_inner_defect_candidates(
         kept[labels == lab] = 255
     return kept
 
-
 def build_adaptive_coil_color_mask(
     img: np.ndarray,
     seed_mask: np.ndarray,
@@ -628,6 +627,7 @@ def apply_texture_mask(
         inward_candidates = cv2.bitwise_and(color_hint_inner_relaxed, hole_region)
         inward_candidates = cv2.bitwise_and(inward_candidates, final_mask)
         strict_inner = cv2.bitwise_and(color_hint_inner_strict, hole_region)
+        relaxed_inner = cv2.bitwise_and(color_hint_inner_relaxed, hole_region)
         preserved_defects = filter_inner_defect_candidates(
             candidate_mask=inward_candidates,
             ring_mask=ring_mask,
