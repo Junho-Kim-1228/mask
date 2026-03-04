@@ -23,6 +23,44 @@ FINAL_OPEN_KERNEL_RATIO = 0.004
 TRIM_KERNEL_RATIO = 0.0045
 SMOOTH_KERNEL_RATIO = 0.003
 HOLE_DILATE_RATIO = 0.0025
+INNER_DEFECT_BAND_RATIO = 0.0045
+INNER_DEFECT_MIN_AREA_RATIO = 0.00001
+INNER_DEFECT_MAX_HOLE_RATIO = 0.18
+INNER_DEFECT_MIN_TOUCH_RATIO = 0.03
+INNER_DEFECT_CANDIDATE_OPEN_RATIO = 0.0012
+INNER_DEFECT_STRICT_COLOR_OVERLAP_RATIO = 0.02
+INNER_DEFECT_STRICT_COLOR_MIN_PIXELS = 1
+INNER_DEFECT_STRONG_TOUCH_RATIO = 0.14
+COLOR_GATE_H_Q = 92
+COLOR_GATE_H_MARGIN = 4.0
+COLOR_GATE_H_MIN_TOL = 8.0
+COLOR_GATE_H_MAX_TOL = 28.0
+COLOR_GATE_H_MARGIN_RELAXED = 7.0
+COLOR_GATE_H_MAX_TOL_RELAXED = 40.0
+COLOR_GATE_S_MARGIN = 28
+COLOR_GATE_V_MARGIN = 36
+COLOR_GATE_S_MARGIN_RELAXED = 44
+COLOR_GATE_V_MARGIN_RELAXED = 56
+COLOR_GATE_A_MARGIN = 12
+COLOR_GATE_B_MARGIN = 14
+COLOR_GATE_A_MARGIN_RELAXED = 20
+COLOR_GATE_B_MARGIN_RELAXED = 24
+COLOR_GATE_LOW_SAT_Q = 12
+COLOR_GATE_HIGH_V_Q = 88
+COLOR_GATE_LOW_SAT_PAD = 8
+COLOR_GATE_HIGH_V_PAD = 18
+COLOR_GATE_CHROMA_LOW_Q = 14
+COLOR_GATE_CHROMA_LOW_SCALE = 0.62
+COLOR_GATE_CHROMA_LOW_MIN = 9.0
+COLOR_GATE_CHROMA_LOW_MAX = 36.0
+COLOR_GATE_HIGH_L_Q = 86
+COLOR_GATE_HIGH_L_PAD = 12
+COLOR_GATE_MIN_SAMPLE = 120
+COLOR_GATE_MORPH_RATIO = 0.0035
+COLOR_KEEP_MIN_RATIO = 0.55
+COLOR_KEEP_MIN_RATIO_RELAXED = 0.32
+POST_COLOR_RECOVER_RATIO = 0.003
+POST_COLOR_SMOOTH_BOOST = 1
 INNER_RECT_W_SCALE_FROM_HOLE = 1.00
 INNER_RECT_H_SCALE_FROM_HOLE = 0.90
 INNER_RECT_FALLBACK_W_RATIO = 0.45
@@ -166,6 +204,189 @@ def build_inner_rounded_rect_hole(
     rw = int(bw * INNER_RECT_FALLBACK_W_RATIO)
     rh = int(bh * INNER_RECT_FALLBACK_H_RATIO)
     return draw_rounded_rect((h, w), (cx, cy), (rw, rh), INNER_RECT_CORNER_RATIO)
+
+
+def filter_inner_defect_candidates(
+    candidate_mask: np.ndarray,
+    ring_mask: np.ndarray,
+    hole_region: np.ndarray,
+    short_side: int,
+    image_area: int,
+    strict_color_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Keep only plausible inward coil defects:
+    - located in inner-hole region
+    - touching the ring boundary
+    - not too tiny / not too large
+    """
+    if not np.any(candidate_mask) or not np.any(ring_mask) or not np.any(hole_region):
+        return np.zeros_like(candidate_mask)
+
+    open_k = kernel_from_ratio(short_side, INNER_DEFECT_CANDIDATE_OPEN_RATIO)
+    candidates = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, open_k)
+    candidates = cv2.bitwise_and(candidates, hole_region)
+    if not np.any(candidates):
+        return np.zeros_like(candidate_mask)
+
+    band_k = kernel_from_ratio(short_side, INNER_DEFECT_BAND_RATIO)
+    touch_band = cv2.dilate(ring_mask, band_k, iterations=1)
+    touch_band = cv2.bitwise_and(touch_band, hole_region)
+
+    hole_area = int(np.count_nonzero(hole_region))
+    min_area = max(8, int(image_area * INNER_DEFECT_MIN_AREA_RATIO))
+    max_area = max(min_area * 2, int(hole_area * INNER_DEFECT_MAX_HOLE_RATIO))
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidates, connectivity=8
+    )
+    kept = np.zeros_like(candidate_mask)
+    if num_labels <= 1:
+        return kept
+
+    for lab in range(1, num_labels):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < min_area or area > max_area:
+            continue
+
+        comp = np.zeros_like(candidate_mask)
+        comp[labels == lab] = 255
+        touch = int(np.count_nonzero(cv2.bitwise_and(comp, touch_band)))
+        min_touch = max(2, int(area * INNER_DEFECT_MIN_TOUCH_RATIO))
+        if touch < min_touch:
+            continue
+
+        strong_touch = touch >= max(3, int(area * INNER_DEFECT_STRONG_TOUCH_RATIO))
+        if strict_color_mask is not None and np.any(strict_color_mask):
+            strict_overlap = int(np.count_nonzero(cv2.bitwise_and(comp, strict_color_mask)))
+            min_overlap = max(
+                INNER_DEFECT_STRICT_COLOR_MIN_PIXELS,
+                int(area * INNER_DEFECT_STRICT_COLOR_OVERLAP_RATIO),
+            )
+            if strict_overlap < min_overlap and not strong_touch:
+                continue
+
+        kept[labels == lab] = 255
+    return kept
+
+
+def build_adaptive_coil_color_mask(
+    img: np.ndarray,
+    seed_mask: np.ndarray,
+    short_side: int,
+    relaxed: bool = False,
+) -> np.ndarray:
+    """
+    Build an adaptive HSV color gate from the current coil mask.
+    """
+    h, w = seed_mask.shape[:2]
+    full = np.full((h, w), 255, dtype=np.uint8)
+    if not np.any(seed_mask):
+        return full
+
+    seed = np.where(seed_mask > 0, 255, 0).astype(np.uint8)
+    core_k = kernel_from_ratio(short_side, COLOR_GATE_MORPH_RATIO)
+    seed_core = cv2.erode(seed, core_k, iterations=1)
+    if int(np.count_nonzero(seed_core)) < COLOR_GATE_MIN_SAMPLE:
+        seed_core = seed
+    if int(np.count_nonzero(seed_core)) < COLOR_GATE_MIN_SAMPLE:
+        return full
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    sample_hsv = hsv[seed_core > 0]
+    sample_lab = lab[seed_core > 0]
+    if sample_hsv.shape[0] < COLOR_GATE_MIN_SAMPLE or sample_lab.shape[0] < COLOR_GATE_MIN_SAMPLE:
+        return full
+
+    h_vals = sample_hsv[:, 0].astype(np.float32)
+    s_vals = sample_hsv[:, 1].astype(np.float32)
+    v_vals = sample_hsv[:, 2].astype(np.float32)
+    l_vals = sample_lab[:, 0].astype(np.float32)
+    a_vals = sample_lab[:, 1].astype(np.float32)
+    b_vals = sample_lab[:, 2].astype(np.float32)
+    chroma_vals = np.sqrt((a_vals - 128.0) ** 2 + (b_vals - 128.0) ** 2)
+
+    # Circular mean/tolerance for hue (0..179 wrap-around safe)
+    angles = h_vals * (2.0 * np.pi / 180.0)
+    mean_sin = float(np.mean(np.sin(angles)))
+    mean_cos = float(np.mean(np.cos(angles)))
+    center_angle = np.arctan2(mean_sin, mean_cos)
+    if center_angle < 0:
+        center_angle += 2.0 * np.pi
+    h_center = center_angle * (180.0 / (2.0 * np.pi))
+    h_diff = np.abs(((h_vals - h_center + 90.0) % 180.0) - 90.0)
+    h_tol_raw = float(np.percentile(h_diff, COLOR_GATE_H_Q))
+
+    if relaxed:
+        h_tol = min(COLOR_GATE_H_MAX_TOL_RELAXED, h_tol_raw + COLOR_GATE_H_MARGIN_RELAXED)
+        s_margin = COLOR_GATE_S_MARGIN_RELAXED
+        v_margin = COLOR_GATE_V_MARGIN_RELAXED
+        a_margin = COLOR_GATE_A_MARGIN_RELAXED
+        b_margin = COLOR_GATE_B_MARGIN_RELAXED
+    else:
+        h_tol = min(COLOR_GATE_H_MAX_TOL, h_tol_raw + COLOR_GATE_H_MARGIN)
+        s_margin = COLOR_GATE_S_MARGIN
+        v_margin = COLOR_GATE_V_MARGIN
+        a_margin = COLOR_GATE_A_MARGIN
+        b_margin = COLOR_GATE_B_MARGIN
+    h_tol = max(COLOR_GATE_H_MIN_TOL, h_tol)
+
+    s_lo, s_hi = np.percentile(s_vals, [8, 94])
+    v_lo, v_hi = np.percentile(v_vals, [6, 96])
+    a_lo, a_hi = np.percentile(a_vals, [6, 96])
+    b_lo, b_hi = np.percentile(b_vals, [6, 96])
+    s_low = int(np.clip(np.floor(s_lo - s_margin), 0, 255))
+    s_high = int(np.clip(np.ceil(s_hi + s_margin), 0, 255))
+    v_low = int(np.clip(np.floor(v_lo - v_margin), 0, 255))
+    v_high = int(np.clip(np.ceil(v_hi + v_margin), 0, 255))
+    a_low = int(np.clip(np.floor(a_lo - a_margin), 0, 255))
+    a_high = int(np.clip(np.ceil(a_hi + a_margin), 0, 255))
+    b_low = int(np.clip(np.floor(b_lo - b_margin), 0, 255))
+    b_high = int(np.clip(np.ceil(b_hi + b_margin), 0, 255))
+
+    h_channel = hsv[:, :, 0].astype(np.float32)
+    hue_dist = np.abs(((h_channel - h_center + 90.0) % 180.0) - 90.0)
+    hue_mask = np.where(hue_dist <= h_tol, 255, 0).astype(np.uint8)
+
+    sv_mask = cv2.inRange(
+        hsv[:, :, 1:3],
+        np.array([s_low, v_low], dtype=np.uint8),
+        np.array([s_high, v_high], dtype=np.uint8),
+    )
+    ab_mask = cv2.inRange(
+        lab[:, :, 1:3],
+        np.array([a_low, b_low], dtype=np.uint8),
+        np.array([a_high, b_high], dtype=np.uint8),
+    )
+    color_mask = cv2.bitwise_and(hue_mask, sv_mask)
+    color_mask = cv2.bitwise_and(color_mask, ab_mask)
+
+    low_sat_thr = int(np.clip(np.percentile(s_vals, COLOR_GATE_LOW_SAT_Q) - COLOR_GATE_LOW_SAT_PAD, 0, 255))
+    high_v_thr = int(np.clip(np.percentile(v_vals, COLOR_GATE_HIGH_V_Q) + COLOR_GATE_HIGH_V_PAD, 0, 255))
+    high_l_thr = int(np.clip(np.percentile(l_vals, COLOR_GATE_HIGH_L_Q) + COLOR_GATE_HIGH_L_PAD, 0, 255))
+    chroma_low_thr = float(np.percentile(chroma_vals, COLOR_GATE_CHROMA_LOW_Q) * COLOR_GATE_CHROMA_LOW_SCALE)
+    chroma_low_thr = float(np.clip(chroma_low_thr, COLOR_GATE_CHROMA_LOW_MIN, COLOR_GATE_CHROMA_LOW_MAX))
+
+    sat_map = hsv[:, :, 1].astype(np.float32)
+    v_map = hsv[:, :, 2].astype(np.float32)
+    l_map = lab[:, :, 0].astype(np.float32)
+    a_map = lab[:, :, 1].astype(np.float32)
+    b_map = lab[:, :, 2].astype(np.float32)
+    chroma_map = np.sqrt((a_map - 128.0) ** 2 + (b_map - 128.0) ** 2)
+    bright_neutral = (
+        (sat_map <= float(low_sat_thr))
+        & (chroma_map <= chroma_low_thr)
+        & ((v_map >= float(high_v_thr)) | (l_map >= float(high_l_thr)))
+    )
+    color_mask[bright_neutral] = 0
+
+    mk = kernel_from_ratio(short_side, COLOR_GATE_MORPH_RATIO)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, mk)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, mk)
+    if relaxed:
+        color_mask = cv2.dilate(color_mask, mk, iterations=1)
+    return color_mask
 
 
 def trim_mask(mask: np.ndarray, short_side: int, trim_level: int) -> np.ndarray:
@@ -374,23 +595,107 @@ def apply_texture_mask(
     final_mask = trim_mask(final_mask, short_side, trim_level)
     final_mask = smooth_mask_boundary(final_mask, short_side, smooth_level)
 
-    # 내부 컷은 둥근 직사각형으로 고정합니다.
+    # 내부는 둥근 직사각형으로 비우되, 코일색 + 링 경계 접촉 조건을 만족하는
+    # 내부 돌출만 다시 복원해 오검출 부품을 줄입니다.
     rounded_hole = build_inner_rounded_rect_hole(
         hole_template=hole_template,
         outer_contour=contours[outer_idx],
         shape=final_mask.shape[:2],
     )
+    hole_candidate = np.zeros_like(final_mask)
+    preserved_defects = np.zeros_like(final_mask)
     if np.any(rounded_hole):
         hole_k = kernel_from_ratio(short_side, HOLE_DILATE_RATIO)
-        hole_keep = cv2.dilate(rounded_hole, hole_k, iterations=1)
-        hole_keep = cv2.bitwise_and(hole_keep, final_mask)
-        final_mask[hole_keep > 0] = 0
+        hole_region = cv2.dilate(rounded_hole, hole_k, iterations=1)
+        hole_candidate = cv2.bitwise_and(hole_region, final_mask)
+
+        ring_mask = final_mask.copy()
+        ring_mask[hole_region > 0] = 0
+        ring_mask = keep_largest_component(ring_mask)
+
+        color_hint_inner_relaxed = build_adaptive_coil_color_mask(
+            img=img,
+            seed_mask=ring_mask,
+            short_side=short_side,
+            relaxed=True,
+        )
+        color_hint_inner_strict = build_adaptive_coil_color_mask(
+            img=img,
+            seed_mask=ring_mask,
+            short_side=short_side,
+            relaxed=False,
+        )
+        inward_candidates = cv2.bitwise_and(color_hint_inner_relaxed, hole_region)
+        inward_candidates = cv2.bitwise_and(inward_candidates, final_mask)
+        strict_inner = cv2.bitwise_and(color_hint_inner_strict, hole_region)
+        preserved_defects = filter_inner_defect_candidates(
+            candidate_mask=inward_candidates,
+            ring_mask=ring_mask,
+            hole_region=hole_region,
+            short_side=short_side,
+            image_area=image_area,
+            strict_color_mask=strict_inner,
+        )
+
+        # 내부 후보를 일단 모두 제거 후, 검증된 내부 돌출만 다시 복원합니다.
+        final_mask[hole_region > 0] = 0
+        if np.any(preserved_defects):
+            final_mask[preserved_defects > 0] = 255
+        final_mask = keep_largest_component(final_mask)
+
+    # 10. 코일 색상 기반 적응형 게이트: 코일과 유사한 색만 최종 보존
+    mask_before_color = final_mask.copy()
+    color_mask = build_adaptive_coil_color_mask(
+        img=img,
+        seed_mask=mask_before_color,
+        short_side=short_side,
+        relaxed=False,
+    )
+    color_filtered = cv2.bitwise_and(mask_before_color, color_mask)
+
+    before_area = int(np.count_nonzero(mask_before_color))
+    after_area = int(np.count_nonzero(color_filtered))
+    if before_area > 0 and after_area >= int(before_area * COLOR_KEEP_MIN_RATIO):
+        final_mask = keep_largest_component(color_filtered)
+    else:
+        # 1차 게이트가 과도하면 완화된 범위로 재시도
+        color_mask_relaxed = build_adaptive_coil_color_mask(
+            img=img,
+            seed_mask=mask_before_color,
+            short_side=short_side,
+            relaxed=True,
+        )
+        color_relaxed = cv2.bitwise_and(mask_before_color, color_mask_relaxed)
+        relaxed_area = int(np.count_nonzero(color_relaxed))
+        if before_area > 0 and relaxed_area >= int(before_area * COLOR_KEEP_MIN_RATIO_RELAXED):
+            final_mask = keep_largest_component(color_relaxed)
+
+    # 색상 게이트 후 경계 과절삭 보정: 얇게 확장 후 원래 후보 영역 내로 제한
+    if np.any(final_mask):
+        recover_k = kernel_from_ratio(short_side, POST_COLOR_RECOVER_RATIO)
+        final_mask = cv2.dilate(final_mask, recover_k, iterations=1)
+        final_mask = cv2.bitwise_and(final_mask, mask_before_color)
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, recover_k)
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, recover_k)
+        final_mask = smooth_mask_boundary(
+            final_mask,
+            short_side,
+            min(5, smooth_level + POST_COLOR_SMOOTH_BOOST),
+        )
+        final_mask = keep_largest_component(final_mask)
+
+    # 후반 스무딩에서 내부 홀이 메워지는 것을 방지하기 위해
+    # 내부 컷/결함 복원을 마지막에 한 번 더 강제합니다.
+    if np.any(hole_candidate):
+        final_mask[hole_candidate > 0] = 0
+        if np.any(preserved_defects):
+            final_mask[preserved_defects > 0] = 255
         final_mask = keep_largest_component(final_mask)
 
     if not np.any(final_mask):
         return None
 
-    # 10. 원본에 마스크 적용
+    # 11. 원본에 마스크 적용
     return cv2.bitwise_and(img, img, mask=final_mask)
 
 
