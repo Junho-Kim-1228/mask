@@ -9,4 +9,6 @@ packaging==25.0
 pillow==12.1.0
 pyparsing==3.3.1
 python-dateutil==2.9.0.post0
+rembg
 six==1.17.0
+onnxruntime

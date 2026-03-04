@@ -6,7 +6,7 @@ import numpy as np
 
 INPUT_DIR = "data"
 OUTPUT_DIR = "output/coil_only"
-MAX_IMAGES = 20
+MAX_IMAGES = 0
 IMG_EXTS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 MIN_CONTOUR_AREA_RATIO = 0.01
@@ -306,7 +306,6 @@ def build_adaptive_coil_color_mask(
     b_vals = sample_lab[:, 2].astype(np.float32)
     chroma_vals = np.sqrt((a_vals - 128.0) ** 2 + (b_vals - 128.0) ** 2)
 
-    # Circular mean/tolerance for hue (0..179 wrap-around safe)
     angles = h_vals * (2.0 * np.pi / 180.0)
     mean_sin = float(np.mean(np.sin(angles)))
     mean_cos = float(np.mean(np.cos(angles)))
@@ -404,7 +403,6 @@ def trim_mask(mask: np.ndarray, short_side: int, trim_level: int) -> np.ndarray:
 
     trimmed = cv2.erode(mask, kernel, iterations=erode_iter)
 
-    # 얇은 잔가지 제거를 위한 추가 open
     k2 = odd_int(max(3, k // 2), min_value=3)
     k2_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
     trimmed = cv2.morphologyEx(trimmed, cv2.MORPH_OPEN, k2_kernel)
@@ -413,7 +411,6 @@ def trim_mask(mask: np.ndarray, short_side: int, trim_level: int) -> np.ndarray:
     if not np.any(trimmed):
         return mask
 
-    # 과도한 손실 방지: trim_level이 높아도 최소 15%는 유지
     before_area = int(np.count_nonzero(mask))
     after_area = int(np.count_nonzero(trimmed))
     if after_area < int(before_area * 0.15):
@@ -429,13 +426,11 @@ def smooth_mask_boundary(mask: np.ndarray, short_side: int, smooth_level: int) -
     blurred = cv2.GaussianBlur(mask, (blur_k, blur_k), 0)
     _, smoothed = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
 
-    # 경계 톱니를 줄이되 본체 손실은 최소화
     morph_k = odd_int(max(3, blur_k // 2), min_value=3)
     mk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_k, morph_k))
     smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_OPEN, mk)
     smoothed = keep_largest_component(smoothed)
 
-    # 고강도 스무딩에서는 외곽 컨투어 자체를 평활화하여 톱니를 더 줄입니다.
     contours, _ = cv2.findContours(smoothed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return smoothed
@@ -466,7 +461,6 @@ def smooth_mask_boundary(mask: np.ndarray, short_side: int, smooth_level: int) -
     cv2.drawContours(contour_smooth, [smooth_cnt], -1, 255, cv2.FILLED)
     contour_smooth = keep_largest_component(contour_smooth)
 
-    # 지나친 형태 붕괴 방지
     before_area = int(np.count_nonzero(smoothed))
     after_area = int(np.count_nonzero(contour_smooth))
     if before_area > 0 and after_area < int(before_area * 0.55):
@@ -529,27 +523,22 @@ def apply_texture_mask(
     short_side = min(h, w)
     image_area = h * w
 
-    # 1. 흑백 변환 + 엣지 강도
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     magnitude = cv2.magnitude(sobel_x, sobel_y)
 
-    # 2. 텍스처 에너지 맵 생성 (해상도 비례 커널)
     energy_k = odd_int(int(short_side * ENERGY_KERNEL_RATIO), min_value=3)
     energy = cv2.boxFilter(magnitude, -1, (energy_k, energy_k))
     energy_8u = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
 
-    # 3. 자동 이진화 (Otsu)
     _, mask = cv2.threshold(energy_8u, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-    # 4. 형태 정리 (해상도 비례 Open -> Close)
     kernel_open = kernel_from_ratio(short_side, OPEN_KERNEL_RATIO)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
     kernel_close = kernel_from_ratio(short_side, CLOSE_KERNEL_RATIO)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
-    # 5. 윤곽선 + 계층 검출
     contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if not contours or hierarchy is None:
         return None
@@ -563,11 +552,9 @@ def apply_texture_mask(
     if outer_area <= 0:
         return None
 
-    # 6. 선택된 코일 외곽만 채우기
     body_mask = np.zeros_like(gray)
     cv2.drawContours(body_mask, contours, outer_idx, 255, cv2.FILLED)
 
-    # 7. 내부 구멍 제거: 가장 큰 1개가 아니라 큰 구멍들을 모두 반영
     child_idx = hierarchy[outer_idx][2]
     min_hole_area = max(image_area * MIN_HOLE_AREA_RATIO, outer_area * 0.005)
     if child_idx != -1:
@@ -577,25 +564,20 @@ def apply_texture_mask(
                 cv2.drawContours(body_mask, contours, child_idx, 0, cv2.FILLED)
             child_idx = hierarchy[child_idx][0]
 
-    # 내부 구멍 템플릿 보존: 후처리에서 구멍이 메워지면 다시 파냅니다.
     hole_template = extract_largest_internal_hole(
         body_mask,
         min_area=int(image_area * MIN_HOLE_AREA_RATIO),
     )
 
-    # 8. 돌출/가지 제거: opening-by-reconstruction (본체 보존, 얇은 돌기 제거)
     recon_kernel = kernel_from_ratio(short_side, RECON_KERNEL_RATIO)
     refined = opening_by_reconstruction(body_mask, recon_kernel)
 
-    # 9. 마지막 가벼운 정리 + 최대 컴포넌트 보장
     final_kernel = kernel_from_ratio(short_side, FINAL_OPEN_KERNEL_RATIO)
     final_mask = cv2.morphologyEx(refined, cv2.MORPH_OPEN, final_kernel)
     final_mask = keep_largest_component(final_mask)
     final_mask = trim_mask(final_mask, short_side, trim_level)
     final_mask = smooth_mask_boundary(final_mask, short_side, smooth_level)
 
-    # 내부는 둥근 직사각형으로 비우되, 코일색 + 링 경계 접촉 조건을 만족하는
-    # 내부 돌출만 다시 복원해 오검출 부품을 줄입니다.
     rounded_hole = build_inner_rounded_rect_hole(
         hole_template=hole_template,
         outer_contour=contours[outer_idx],
@@ -627,7 +609,6 @@ def apply_texture_mask(
         inward_candidates = cv2.bitwise_and(color_hint_inner_relaxed, hole_region)
         inward_candidates = cv2.bitwise_and(inward_candidates, final_mask)
         strict_inner = cv2.bitwise_and(color_hint_inner_strict, hole_region)
-        relaxed_inner = cv2.bitwise_and(color_hint_inner_relaxed, hole_region)
         preserved_defects = filter_inner_defect_candidates(
             candidate_mask=inward_candidates,
             ring_mask=ring_mask,
@@ -637,13 +618,11 @@ def apply_texture_mask(
             strict_color_mask=strict_inner,
         )
 
-        # 내부 후보를 일단 모두 제거 후, 검증된 내부 돌출만 다시 복원합니다.
         final_mask[hole_region > 0] = 0
         if np.any(preserved_defects):
             final_mask[preserved_defects > 0] = 255
         final_mask = keep_largest_component(final_mask)
 
-    # 10. 코일 색상 기반 적응형 게이트: 코일과 유사한 색만 최종 보존
     mask_before_color = final_mask.copy()
     color_mask = build_adaptive_coil_color_mask(
         img=img,
@@ -658,7 +637,6 @@ def apply_texture_mask(
     if before_area > 0 and after_area >= int(before_area * COLOR_KEEP_MIN_RATIO):
         final_mask = keep_largest_component(color_filtered)
     else:
-        # 1차 게이트가 과도하면 완화된 범위로 재시도
         color_mask_relaxed = build_adaptive_coil_color_mask(
             img=img,
             seed_mask=mask_before_color,
@@ -670,7 +648,6 @@ def apply_texture_mask(
         if before_area > 0 and relaxed_area >= int(before_area * COLOR_KEEP_MIN_RATIO_RELAXED):
             final_mask = keep_largest_component(color_relaxed)
 
-    # 색상 게이트 후 경계 과절삭 보정: 얇게 확장 후 원래 후보 영역 내로 제한
     if np.any(final_mask):
         recover_k = kernel_from_ratio(short_side, POST_COLOR_RECOVER_RATIO)
         final_mask = cv2.dilate(final_mask, recover_k, iterations=1)
@@ -684,8 +661,6 @@ def apply_texture_mask(
         )
         final_mask = keep_largest_component(final_mask)
 
-    # 후반 스무딩에서 내부 홀이 메워지는 것을 방지하기 위해
-    # 내부 컷/결함 복원을 마지막에 한 번 더 강제합니다.
     if np.any(hole_candidate):
         final_mask[hole_candidate > 0] = 0
         if np.any(preserved_defects):
@@ -695,17 +670,16 @@ def apply_texture_mask(
     if not np.any(final_mask):
         return None
 
-    # 11. 원본에 마스크 적용
     return cv2.bitwise_and(img, img, mask=final_mask)
 
 
-def collect_image_files(in_dir: Path, max_images: int) -> list[Path]:
+def collect_image_files(in_dir: Path) -> list[Path]:
     img_files = [
         p for p in sorted(in_dir.iterdir())
         if p.is_file() and p.suffix.lower() in IMG_EXTS
     ]
-    if max_images > 0:
-        img_files = img_files[:max_images]
+    if MAX_IMAGES > 0:
+        img_files = img_files[:MAX_IMAGES]
     return img_files
 
 
@@ -721,7 +695,7 @@ def run_mask_batch(
         print(f"[ERROR] 입력 폴더 없음: {in_dir.resolve()}")
         return
 
-    img_files = collect_image_files(in_dir, MAX_IMAGES)
+    img_files = collect_image_files(in_dir)
     if not img_files:
         print(f"[ERROR] 처리할 이미지가 없습니다: {in_dir.resolve()}")
         return
@@ -761,7 +735,7 @@ def run_mask_batch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Edge/Texture 기반 코일 정밀 마스킹 배치 처리 (입/출력/개수 고정)"
+        description="Edge/Texture 기반 코일 정밀 마스킹 배치 처리 (입/출력 고정, 폴더 전체 처리)"
     )
     parser.add_argument(
         "--trim-level",
