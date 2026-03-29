@@ -628,24 +628,44 @@ class TrackbarApp:
         self.request_compute(immediate=False)
 
     def print_status(self) -> None:
-        path = self.image_paths[self.index]
+        image_path = self.image_paths[self.index]
         config = self.current_config()
-        print(f"image={path}")
-        print(
-            "pipeline="
-            f"trim={config['trim_level']} "
-            f"smooth={config['smooth_level']} "
-            f"inner_w={config['inner_rect_w_scale']:.2f} "
-            f"inner_h={config['inner_rect_h_scale']:.2f} "
-            f"hue_margin={config['color_gate_h_margin']:.1f} "
-            f"sat_margin={config['color_gate_s_margin']} "
-            f"val_margin={config['color_gate_v_margin']} "
-            f"high_v_pad={config['color_gate_high_v_pad']} "
-            f"keep={config['color_keep_min_ratio']:.2f} "
-            f"def_max={config['inner_defect_max_hole_ratio']:.2f} "
-            f"def_touch={config['inner_defect_min_touch_ratio']:.2f} "
-            f"def_strong={config['inner_defect_strong_touch_ratio']:.2f}"
+        size_line = ""
+        if self.current_image is not None:
+            h, w = self.current_image.shape[:2]
+            size_line = f"해상도: {w}x{h}"
+
+        lines = [
+            "=" * 56,
+            f"[현재 설정] {image_path.name}",
+        ]
+        if size_line:
+            lines.append(size_line)
+        lines.extend(
+            [
+                "",
+                "[기본]",
+                f"트림      : {config['trim_level']}",
+                f"스무딩    : {config['smooth_level']}",
+                f"내부W     : {config['inner_rect_w_scale']:.2f}",
+                f"내부H     : {config['inner_rect_h_scale']:.2f}",
+                "",
+                "[색상]",
+                f"Hue 허용  : {config['color_gate_h_margin']:.1f}",
+                f"Sat 허용  : {config['color_gate_s_margin']}",
+                f"Val 허용  : {config['color_gate_v_margin']}",
+                f"밝기 제외 : {config['color_gate_high_v_pad']}",
+                "",
+                "[결함]",
+                f"유지율    : {config['color_keep_min_ratio']:.2f}",
+                f"결함최대  : {config['inner_defect_max_hole_ratio']:.2f}",
+                f"접촉 기준 : {config['inner_defect_min_touch_ratio']:.2f}",
+                f"강접촉    : {config['inner_defect_strong_touch_ratio']:.2f}",
+                "",
+                "=" * 56,
+            ]
         )
+        print("\n" + "\n".join(lines))
 
     def change_image(self, delta: int) -> None:
         if not self.image_paths:
