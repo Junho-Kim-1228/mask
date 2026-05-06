@@ -5,7 +5,10 @@ import cv2
 import numpy as np
 
 INPUT_DIR = "data"
-OUTPUT_DIR = "output/coil_only"
+DATASET_DIR = "dataset"
+SEGMENTATION_CLASS_DIR = f"{DATASET_DIR}/SegmentationClass"
+SEGMENTATION_OBJECT_DIR = f"{DATASET_DIR}/SegmentationObject"
+IMAGESET_DEFAULT_PATH = f"{DATASET_DIR}/ImageSets/Segmentation/default.txt"
 MAX_IMAGES = 0
 IMG_EXTS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
@@ -61,6 +64,7 @@ COLOR_KEEP_MIN_RATIO = 0.55
 COLOR_KEEP_MIN_RATIO_RELAXED = 0.32
 POST_COLOR_RECOVER_RATIO = 0.003
 POST_COLOR_SMOOTH_BOOST = 1
+OUTER_RECOVER_RATIO = 0.0
 INNER_RECT_W_SCALE_FROM_HOLE = 1.00
 INNER_RECT_H_SCALE_FROM_HOLE = 0.90
 INNER_RECT_FALLBACK_W_RATIO = 0.45
@@ -514,7 +518,7 @@ def choose_best_outer_contour(
     return max(outer_indices, key=lambda i: cv2.contourArea(contours[i]))
 
 
-def apply_texture_mask(
+def compute_texture_mask(
     img: np.ndarray,
     trim_level: int = DEFAULT_TRIM_LEVEL,
     smooth_level: int = DEFAULT_SMOOTH_LEVEL,
@@ -576,6 +580,7 @@ def apply_texture_mask(
     final_mask = cv2.morphologyEx(refined, cv2.MORPH_OPEN, final_kernel)
     final_mask = keep_largest_component(final_mask)
     final_mask = trim_mask(final_mask, short_side, trim_level)
+    mask_before_smooth = final_mask.copy()
     final_mask = smooth_mask_boundary(final_mask, short_side, smooth_level)
 
     rounded_hole = build_inner_rounded_rect_hole(
@@ -583,6 +588,7 @@ def apply_texture_mask(
         outer_contour=contours[outer_idx],
         shape=final_mask.shape[:2],
     )
+    hole_region = np.zeros_like(final_mask)
     hole_candidate = np.zeros_like(final_mask)
     preserved_defects = np.zeros_like(final_mask)
     if np.any(rounded_hole):
@@ -590,6 +596,16 @@ def apply_texture_mask(
         hole_region = cv2.dilate(rounded_hole, hole_k, iterations=1)
         hole_candidate = cv2.bitwise_and(hole_region, final_mask)
 
+        if OUTER_RECOVER_RATIO > 0 and np.any(final_mask):
+            outer_recover_k = kernel_from_ratio(short_side, OUTER_RECOVER_RATIO)
+            ring_before_smooth = mask_before_smooth.copy()
+            ring_before_smooth[hole_region > 0] = 0
+            ring_after_smooth = final_mask.copy()
+            ring_after_smooth[hole_region > 0] = 0
+            recovered_ring = cv2.dilate(ring_after_smooth, outer_recover_k, iterations=1)
+            recovered_ring = cv2.bitwise_and(recovered_ring, ring_before_smooth)
+            final_mask = keep_largest_component(recovered_ring)
+            hole_candidate = cv2.bitwise_and(hole_region, final_mask)
         ring_mask = final_mask.copy()
         ring_mask[hole_region > 0] = 0
         ring_mask = keep_largest_component(ring_mask)
@@ -621,6 +637,11 @@ def apply_texture_mask(
         final_mask[hole_region > 0] = 0
         if np.any(preserved_defects):
             final_mask[preserved_defects > 0] = 255
+        final_mask = keep_largest_component(final_mask)
+    elif OUTER_RECOVER_RATIO > 0 and np.any(final_mask):
+        outer_recover_k = kernel_from_ratio(short_side, OUTER_RECOVER_RATIO)
+        final_mask = cv2.dilate(final_mask, outer_recover_k, iterations=1)
+        final_mask = cv2.bitwise_and(final_mask, mask_before_smooth)
         final_mask = keep_largest_component(final_mask)
 
     mask_before_color = final_mask.copy()
@@ -661,8 +682,8 @@ def apply_texture_mask(
         )
         final_mask = keep_largest_component(final_mask)
 
-    if np.any(hole_candidate):
-        final_mask[hole_candidate > 0] = 0
+    if np.any(hole_region):
+        final_mask[hole_region > 0] = 0
         if np.any(preserved_defects):
             final_mask[preserved_defects > 0] = 255
         final_mask = keep_largest_component(final_mask)
@@ -670,6 +691,21 @@ def apply_texture_mask(
     if not np.any(final_mask):
         return None
 
+    return final_mask
+
+
+def apply_texture_mask(
+    img: np.ndarray,
+    trim_level: int = DEFAULT_TRIM_LEVEL,
+    smooth_level: int = DEFAULT_SMOOTH_LEVEL,
+) -> np.ndarray | None:
+    final_mask = compute_texture_mask(
+        img=img,
+        trim_level=trim_level,
+        smooth_level=smooth_level,
+    )
+    if final_mask is None:
+        return None
     return cv2.bitwise_and(img, img, mask=final_mask)
 
 
@@ -688,8 +724,12 @@ def run_mask_batch(
     smooth_level: int = DEFAULT_SMOOTH_LEVEL,
 ) -> None:
     in_dir = Path(INPUT_DIR)
-    out_dir = Path(OUTPUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    mask_out_dir = Path(SEGMENTATION_CLASS_DIR)
+    object_out_dir = Path(SEGMENTATION_OBJECT_DIR)
+    default_txt_path = Path(IMAGESET_DEFAULT_PATH)
+    mask_out_dir.mkdir(parents=True, exist_ok=True)
+    object_out_dir.mkdir(parents=True, exist_ok=True)
+    default_txt_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not in_dir.exists():
         print(f"[ERROR] 입력 폴더 없음: {in_dir.resolve()}")
@@ -701,6 +741,7 @@ def run_mask_batch(
         return
 
     ok, fail, skip = 0, 0, 0
+    saved_stems: list[str] = []
     for idx, img_path in enumerate(img_files, start=1):
         img = cv2.imread(str(img_path))
         if img is None:
@@ -708,34 +749,48 @@ def run_mask_batch(
             fail += 1
             continue
 
-        result = apply_texture_mask(
+        final_mask = compute_texture_mask(
             img=img,
             trim_level=trim_level,
             smooth_level=smooth_level,
         )
-        if result is None:
+        if final_mask is None:
             print(f"[SKIP {idx}/{len(img_files)}] 코일 감지 실패: {img_path.name}")
             skip += 1
             continue
 
-        out_path = out_dir / f"{img_path.stem}_masked.bmp"
-        if cv2.imwrite(str(out_path), result):
-            print(f"[OK {idx}/{len(img_files)}] {img_path.name} -> {out_path.name}")
+        mask_path = mask_out_dir / f"{img_path.stem}.png"
+        object_mask_path = object_out_dir / f"{img_path.stem}.png"
+        final_mask_index = (final_mask > 0).astype(np.uint8)
+        saved_mask = cv2.imwrite(str(mask_path), final_mask_index)
+        saved_object_mask = cv2.imwrite(str(object_mask_path), final_mask_index)
+        if saved_mask and saved_object_mask:
+            print(
+                f"[OK {idx}/{len(img_files)}] {img_path.name} -> "
+                f"{mask_path.name}, {object_mask_path.name}"
+            )
+            saved_stems.append(img_path.stem)
             ok += 1
         else:
             print(f"[FAIL {idx}/{len(img_files)}] 저장 실패: {img_path.name}")
             fail += 1
 
+    default_txt_path.write_text(
+        "\n".join(saved_stems) + ("\n" if saved_stems else ""),
+        encoding="utf-8",
+    )
+
     print(
         f"\n완료: 성공 {ok}, 실패 {fail}, 스킵 {skip}, 대상 {len(img_files)}\n"
         f"- 입력: {in_dir.resolve()}\n"
-        f"- 출력: {out_dir.resolve()}"
+        f"- SegmentationClass 출력: {mask_out_dir.resolve()}\n"
+        f"- ImageSets 목록: {default_txt_path.resolve()}"
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Edge/Texture 기반 코일 정밀 마스킹 배치 처리 (입/출력 고정, 폴더 전체 처리)"
+        description="Edge/Texture 기반 코일 마스크를 생성해 dataset/SegmentationClass에 저장합니다."
     )
     parser.add_argument(
         "--trim-level",

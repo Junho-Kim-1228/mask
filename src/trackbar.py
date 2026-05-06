@@ -35,6 +35,7 @@ SUBTEXT = "#b8b8b8"
 SLIDER_SPECS = [
     ("trim_level", "트림", int(pipeline.DEFAULT_TRIM_LEVEL), 8, lambda v: f"{int(v)}"),
     ("smooth_level", "스무딩", int(pipeline.DEFAULT_SMOOTH_LEVEL), 20, lambda v: f"{int(v)}"),
+    ("outer_recover_ratio", "외곽복원", int(round(pipeline.OUTER_RECOVER_RATIO * 10000)), 120, lambda v: f"{v / 10000.0:.4f}"),
     ("inner_rect_w_scale", "내부W", int(round(pipeline.INNER_RECT_W_SCALE_FROM_HOLE * 100)), 160, lambda v: f"{v / 100.0:.2f}"),
     ("inner_rect_h_scale", "내부H", int(round(pipeline.INNER_RECT_H_SCALE_FROM_HOLE * 100)), 160, lambda v: f"{v / 100.0:.2f}"),
     ("color_gate_h_margin", "Hue", int(round(pipeline.COLOR_GATE_H_MARGIN * 10)), 120, lambda v: f"{v / 10.0:.1f}"),
@@ -48,7 +49,7 @@ SLIDER_SPECS = [
 ]
 
 PAGE_SPECS = [
-    ("기본", ["trim_level", "smooth_level", "inner_rect_w_scale", "inner_rect_h_scale"]),
+    ("기본", ["trim_level", "smooth_level", "outer_recover_ratio", "inner_rect_w_scale", "inner_rect_h_scale"]),
     ("색상", ["color_gate_h_margin", "color_gate_s_margin", "color_gate_v_margin", "color_gate_high_v_pad"]),
     ("결함", ["color_keep_min_ratio", "inner_defect_max_hole_ratio", "inner_defect_min_touch_ratio", "inner_defect_strong_touch_ratio"]),
 ]
@@ -61,6 +62,7 @@ SLIDER_META = {
 SLIDER_DESCRIPTIONS = {
     "trim_level": "코일 외곽을 추가로 얼마나 깎을지 조절합니다.",
     "smooth_level": "코일 경계를 얼마나 매끈하게 만들지 조절합니다.",
+    "outer_recover_ratio": "스무딩 뒤 줄어든 외곽을 원래 마스크 범위 안에서 되돌립니다.",
     "inner_rect_w_scale": "내부 빈 영역의 가로 크기 비율입니다.",
     "inner_rect_h_scale": "내부 빈 영역의 세로 크기 비율입니다.",
     "color_gate_h_margin": "코일 색상으로 인정할 Hue 허용 폭입니다.",
@@ -85,6 +87,7 @@ PIPELINE_DEFAULTS = {
     "COLOR_GATE_HIGH_V_PAD": pipeline.COLOR_GATE_HIGH_V_PAD,
     "COLOR_KEEP_MIN_RATIO": pipeline.COLOR_KEEP_MIN_RATIO,
     "COLOR_KEEP_MIN_RATIO_RELAXED": pipeline.COLOR_KEEP_MIN_RATIO_RELAXED,
+    "OUTER_RECOVER_RATIO": pipeline.OUTER_RECOVER_RATIO,
     "INNER_DEFECT_MAX_HOLE_RATIO": pipeline.INNER_DEFECT_MAX_HOLE_RATIO,
     "INNER_DEFECT_MIN_TOUCH_RATIO": pipeline.INNER_DEFECT_MIN_TOUCH_RATIO,
     "INNER_DEFECT_STRONG_TOUCH_RATIO": pipeline.INNER_DEFECT_STRONG_TOUCH_RATIO,
@@ -161,6 +164,7 @@ def decode_config(raw_values: dict[str, int]) -> dict[str, float | int]:
     return {
         "trim_level": int(raw_values["trim_level"]),
         "smooth_level": int(raw_values["smooth_level"]),
+        "outer_recover_ratio": raw_values["outer_recover_ratio"] / 10000.0,
         "inner_rect_w_scale": raw_values["inner_rect_w_scale"] / 100.0,
         "inner_rect_h_scale": raw_values["inner_rect_h_scale"] / 100.0,
         "color_gate_h_margin": raw_values["color_gate_h_margin"] / 10.0,
@@ -175,6 +179,7 @@ def decode_config(raw_values: dict[str, int]) -> dict[str, float | int]:
 
 
 def apply_pipeline_config(config: dict[str, float | int]) -> None:
+    pipeline.OUTER_RECOVER_RATIO = float(config["outer_recover_ratio"])
     pipeline.INNER_RECT_W_SCALE_FROM_HOLE = float(config["inner_rect_w_scale"])
     pipeline.INNER_RECT_H_SCALE_FROM_HOLE = float(config["inner_rect_h_scale"])
 
@@ -647,6 +652,7 @@ class TrackbarApp:
                 "[기본]",
                 f"트림      : {config['trim_level']}",
                 f"스무딩    : {config['smooth_level']}",
+                f"외곽복원  : {config['outer_recover_ratio']:.4f}",
                 f"내부W     : {config['inner_rect_w_scale']:.2f}",
                 f"내부H     : {config['inner_rect_h_scale']:.2f}",
                 "",
