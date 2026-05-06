@@ -1,9 +1,28 @@
-# data 폴더 안의 모든 파일 제외
-data/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
 
-# 혹은 모든 .bmp 파일 제외
+# Raw images and local data
+data/
+dataset/
+1.0ds/
+2.0ds/
+2.1ds/
+3.0ds/
+3.0lds/
+prepared_1.0ds/
+prepared_trainset/
+
+# Large image assets
 *.bmp
 *.BMP
 
-# 결과물 폴더 제외 (선택 사항)
+# Model weights and training artifacts
+models/
+*.pt
+*.pth
+
+# Generated outputs
 output/
+*.zip
