@@ -80,6 +80,25 @@ def build_train_transform(input_size: int):
                 fill_mask=0,
                 p=0.4,
             ),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.18,
+                contrast_limit=0.18,
+                p=0.5,
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=10,
+                sat_shift_limit=20,
+                val_shift_limit=20,
+                p=0.4,
+            ),
+            A.ColorJitter(
+                brightness=0.15,
+                contrast=0.15,
+                saturation=0.15,
+                hue=0.05,
+                p=0.3,
+            ),
+            A.ToGray(p=0.15),
             A.Normalize(mean=config_ai.IMAGE_MEAN, std=config_ai.IMAGE_STD),
             ToTensorV2(transpose_mask=True),
         ]

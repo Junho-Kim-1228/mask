@@ -9,10 +9,17 @@ dataset/
 1.0ds/
 2.0ds/
 2.1ds/
+3.2ds/
+3.3ds/
+4.0ds/
+4.1ds/
+4.2ds/
+4.3ds/
 3.0ds/
 3.0lds/
 prepared_1.0ds/
 prepared_trainset/
+prepared_trainset_v8/
 
 # Large image assets
 *.bmp

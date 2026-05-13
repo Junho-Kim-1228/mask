@@ -120,6 +120,53 @@ def apply_mask_to_image(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cv2.bitwise_and(image, image, mask=mask_u8)
 
 
+def mask_to_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+    return x1, y1, x2, y2
+
+
+def expand_bbox(
+    bbox: tuple[int, int, int, int],
+    image_shape: tuple[int, ...],
+    *,
+    margin_ratio: float = 0.08,
+    min_margin: int = 8,
+) -> tuple[int, int, int, int]:
+    height, width = image_shape[:2]
+    x1, y1, x2, y2 = bbox
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    mx = max(min_margin, int(round(box_w * margin_ratio)))
+    my = max(min_margin, int(round(box_h * margin_ratio)))
+    nx1 = max(0, x1 - mx)
+    ny1 = max(0, y1 - my)
+    nx2 = min(width, x2 + mx)
+    ny2 = min(height, y2 + my)
+    return nx1, ny1, nx2, ny2
+
+
+def crop_to_bbox(image: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+    x1, y1, x2, y2 = bbox
+    return image[y1:y2, x1:x2].copy()
+
+
+def paste_mask_from_bbox(
+    image_shape: tuple[int, ...],
+    crop_mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> np.ndarray:
+    full_mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    x1, y1, x2, y2 = bbox
+    full_mask[y1:y2, x1:x2] = np.where(crop_mask > 0, 255, 0).astype(np.uint8)
+    return full_mask
+
+
 def save_binary_mask(mask_path: Path, mask: np.ndarray) -> None:
     mask_u8 = np.where(mask > 0, 255, 0).astype(np.uint8)
     if not cv2.imwrite(str(mask_path), mask_u8):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 import shutil
 from pathlib import Path
@@ -15,6 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-dir", action="append", dest="source_dirs")
     parser.add_argument("--output-dir", default="prepared_trainset")
     parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--hard-val-source", action="append", dest="hard_val_sources")
+    parser.add_argument("--hard-val-count", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -54,37 +57,55 @@ def ensure_split_dirs(output_dir: Path) -> dict[str, Path]:
     return paths
 
 
-def collect_pairs(source_dirs: list[Path]) -> dict[str, tuple[Path, Path]]:
-    pairs: dict[str, tuple[Path, Path]] = {}
+def collect_pairs(source_dirs: list[Path]) -> dict[str, tuple[Path, Path, str]]:
+    pairs: dict[str, tuple[Path, Path, str]] = {}
     for source_dir in source_dirs:
         images_dir = source_dir / "JPEGImages"
         masks_dir = source_dir / "SegmentationClass"
+        source_name = source_dir.name
         stems = load_stems(source_dir)
         for stem in stems:
             image_path = find_image_path(images_dir, stem)
             mask_path = masks_dir / f"{stem}.png"
             if not mask_path.exists():
                 raise FileNotFoundError(f"마스크를 찾을 수 없습니다: {mask_path}")
-            pairs[stem] = (image_path, mask_path)
+            pairs[stem] = (image_path, mask_path, source_name)
     return pairs
 
 
 def copy_pairs(
     stems: list[str],
-    pairs: dict[str, tuple[Path, Path]],
+    pairs: dict[str, tuple[Path, Path, str]],
     out_images: Path,
     out_masks: Path,
     *,
     overwrite: bool,
-) -> None:
+) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
     for stem in stems:
-        image_path, mask_path = pairs[stem]
+        image_path, mask_path, source_name = pairs[stem]
         dst_image = out_images / image_path.name
         dst_mask = out_masks / mask_path.name
         if overwrite or not dst_image.exists():
             shutil.copy2(image_path, dst_image)
         if overwrite or not dst_mask.exists():
             shutil.copy2(mask_path, dst_mask)
+        records.append(
+            {
+                "stem": stem,
+                "image_name": dst_image.name,
+                "mask_name": dst_mask.name,
+                "source_dir": source_name,
+            }
+        )
+    return records
+
+
+def write_metadata(records: list[dict[str, str]], output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=["stem", "image_name", "mask_name", "source_dir"])
+        writer.writeheader()
+        writer.writerows(records)
 
 
 def main() -> None:
@@ -99,26 +120,41 @@ def main() -> None:
     rnd.shuffle(shuffled)
 
     val_count = max(1, int(round(len(shuffled) * args.val_ratio))) if len(shuffled) > 1 else 0
-    val_stems = sorted(shuffled[:val_count])
-    train_stems = sorted(shuffled[val_count:])
+    hard_val_sources = {s.strip() for s in (args.hard_val_sources or []) if s.strip()}
+    hard_val_stems: list[str] = []
+    if hard_val_sources and args.hard_val_count > 0:
+        for source_name in sorted(hard_val_sources):
+            source_candidates = [stem for stem in shuffled if pairs[stem][2] == source_name]
+            rnd.shuffle(source_candidates)
+            take_count = min(args.hard_val_count, len(source_candidates))
+            hard_val_stems.extend(source_candidates[:take_count])
+
+    hard_val_stems = sorted(set(hard_val_stems))
+    required_val_count = max(val_count, len(hard_val_stems))
+    remaining_for_val = [stem for stem in shuffled if stem not in hard_val_stems]
+    additional_val_count = max(0, required_val_count - len(hard_val_stems))
+    val_stems = sorted(hard_val_stems + remaining_for_val[:additional_val_count])
+    train_stems = sorted([stem for stem in shuffled if stem not in set(val_stems)])
     if not train_stems:
         train_stems, val_stems = val_stems, []
 
     paths = ensure_split_dirs(output_dir)
-    copy_pairs(
+    train_records = copy_pairs(
         train_stems,
         pairs,
         paths["train_images"],
         paths["train_masks"],
         overwrite=args.overwrite,
     )
-    copy_pairs(
+    val_records = copy_pairs(
         val_stems,
         pairs,
         paths["val_images"],
         paths["val_masks"],
         overwrite=args.overwrite,
     )
+    write_metadata(train_records, output_dir / "train_metadata.csv")
+    write_metadata(val_records, output_dir / "val_metadata.csv")
 
     print(
         f"준비 완료\n"
@@ -126,7 +162,11 @@ def main() -> None:
         f"- unique samples: {len(stems)}\n"
         f"- output: {output_dir.resolve()}\n"
         f"- train: {len(train_stems)}\n"
-        f"- val: {len(val_stems)}"
+        f"- val: {len(val_stems)}\n"
+        f"- hard_val_sources: {', '.join(sorted(hard_val_sources)) or '(none)'}\n"
+        f"- hard_val_count_per_source: {args.hard_val_count}\n"
+        f"- train metadata: {(output_dir / 'train_metadata.csv').resolve()}\n"
+        f"- val metadata: {(output_dir / 'val_metadata.csv').resolve()}"
     )
 
 

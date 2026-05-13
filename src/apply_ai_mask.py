@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 from pathlib import Path
 
 import cv2
@@ -9,6 +8,7 @@ import numpy as np
 
 import config_ai
 from io_utils_ai import (
+    apply_mask_to_image,
     crop_to_bbox,
     ensure_dir,
     expand_bbox,
@@ -23,10 +23,10 @@ from segment_model import build_segmenter
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="학습된 AI 모델로 raw 이미지 폴더를 CVAT 재라벨링용 데이터셋으로 변환합니다."
+        description="학습된 AI 모델로 원본 이미지에서 코일만 남긴 전처리 결과를 저장합니다."
     )
     parser.add_argument("--input-dir", default="dataset")
-    parser.add_argument("--output-dir", default="2.0ds")
+    parser.add_argument("--output-dir", default=str(config_ai.OUTPUT_DIR))
     parser.add_argument("--model-path", default=str(config_ai.MODEL_PATH))
     parser.add_argument("--device", default=config_ai.DEVICE)
     parser.add_argument("--input-size", type=int, default=config_ai.INPUT_SIZE)
@@ -42,30 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-hole-area", type=int, default=config_ai.MIN_HOLE_AREA)
     parser.add_argument("--no-keep-largest-component", action="store_true")
     parser.add_argument("--no-preserve-inner-holes", action="store_true")
+    parser.add_argument("--save-mask", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
-
-
-def ensure_cvat_dirs(output_dir: Path) -> dict[str, Path]:
-    paths = {
-        "images": output_dir / "JPEGImages",
-        "seg_class": output_dir / "SegmentationClass",
-        "seg_object": output_dir / "SegmentationObject",
-        "imageset": output_dir / "ImageSets" / "Segmentation",
-    }
-    for path in paths.values():
-        path.mkdir(parents=True, exist_ok=True)
-    return paths
-
-
-def write_labelmap(output_dir: Path) -> None:
-    labelmap = output_dir / "labelmap.txt"
-    labelmap.write_text(
-        "# label : color (RGB) : 'body' parts : actions\n"
-        "background:0,0,0::\n"
-        "coil:255,255,255::\n",
-        encoding="utf-8",
-    )
 
 
 def build_post_cfg(args: argparse.Namespace) -> PostprocessConfig:
@@ -85,9 +64,8 @@ def build_post_cfg(args: argparse.Namespace) -> PostprocessConfig:
 def main() -> None:
     args = parse_args()
     input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
-    paths = ensure_cvat_dirs(output_dir)
-    write_labelmap(output_dir)
+    output_dir = ensure_dir(Path(args.output_dir))
+    mask_dir = ensure_dir(output_dir / "masks") if args.save_mask else None
 
     image_paths = list_image_files(input_dir)
     segmenter = build_segmenter(
@@ -98,12 +76,20 @@ def main() -> None:
     )
     post_cfg = build_post_cfg(args)
 
-    saved_stems: list[str] = []
     ok = 0
-    fail = 0
     skip = 0
+    fail = 0
+
     for idx, image_path in enumerate(image_paths, start=1):
         try:
+            masked_path = output_dir / f"{image_path.stem}_masked.bmp"
+            mask_path = mask_dir / f"{image_path.stem}.png" if mask_dir is not None else None
+
+            if not args.overwrite and masked_path.exists():
+                print(f"[SKIP {idx}/{len(image_paths)}] 이미 존재: {masked_path.name}")
+                skip += 1
+                continue
+
             image = load_image_bgr(image_path)
             probability = segmenter.predict_probability(image)
             final_mask = postprocess_probability_map(probability, post_cfg)
@@ -135,39 +121,31 @@ def main() -> None:
                 skip += 1
                 continue
 
-            dst_image = paths["images"] / image_path.name
-            dst_seg_class = paths["seg_class"] / f"{image_path.stem}.png"
-            dst_seg_object = paths["seg_object"] / f"{image_path.stem}.png"
-            if args.overwrite or not dst_image.exists():
-                shutil.copy2(image_path, dst_image)
+            masked_image = apply_mask_to_image(image, final_mask)
+            if not cv2.imwrite(str(masked_path), masked_image):
+                raise RuntimeError(f"결과 저장 실패: {masked_path}")
 
-            final_mask_index = (final_mask > 0).astype("uint8")
-            if not cv2.imwrite(str(dst_seg_class), final_mask_index):
-                raise RuntimeError(f"SegmentationClass 저장 실패: {dst_seg_class}")
-            if not cv2.imwrite(str(dst_seg_object), final_mask_index):
-                raise RuntimeError(f"SegmentationObject 저장 실패: {dst_seg_object}")
+            if mask_path is not None:
+                final_mask_u8 = (final_mask > 0).astype("uint8") * 255
+                if not cv2.imwrite(str(mask_path), final_mask_u8):
+                    raise RuntimeError(f"마스크 저장 실패: {mask_path}")
 
-            saved_stems.append(image_path.stem)
             print(f"[OK {idx}/{len(image_paths)}] {image_path.name}")
             ok += 1
         except Exception as exc:
             print(f"[FAIL {idx}/{len(image_paths)}] {image_path.name} | {exc}")
             fail += 1
 
-    default_txt = paths["imageset"] / "default.txt"
-    default_txt.write_text(
-        "\n".join(saved_stems) + ("\n" if saved_stems else ""),
-        encoding="utf-8",
-    )
-
     print(
-        f"\n프리라벨 완료\n"
+        f"\n전처리 완료\n"
         f"- input: {input_dir.resolve()}\n"
         f"- output: {output_dir.resolve()}\n"
         f"- ok: {ok}\n"
         f"- skip: {skip}\n"
         f"- fail: {fail}"
     )
+    if mask_dir is not None:
+        print(f"- mask_dir: {mask_dir.resolve()}")
 
 
 if __name__ == "__main__":

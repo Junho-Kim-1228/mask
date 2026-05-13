@@ -7,7 +7,7 @@ SRC_DIR = ROOT_DIR / "src"
 DATA_DIR = ROOT_DIR / "data"
 OUTPUT_DIR = ROOT_DIR / "output" / "coil_only_ai"
 MODELS_DIR = ROOT_DIR / "models"
-MODEL_PATH = MODELS_DIR / "coil_unetpp_effb4_best.pt"
+MODEL_PATH = MODELS_DIR / "coil_unetpp_effb4_scratch_v7_best.pt"
 
 VALID_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
@@ -32,6 +32,7 @@ MASK_THRESHOLD = 0.50
 MIN_COMPONENT_AREA = 256
 MORPH_OPEN_KERNEL = 0
 MORPH_CLOSE_KERNEL = 0
+OUTER_RECOVER_KERNEL = 0
 KEEP_LARGEST_COMPONENT = True
 PRESERVE_INNER_HOLES = True
 MIN_HOLE_AREA = 64
@@ -51,4 +52,4 @@ WEIGHT_DECAY = 1e-4
 AMP = True
 PIN_MEMORY = False
 BEST_CHECKPOINT_PATH = MODEL_PATH
-LAST_CHECKPOINT_PATH = MODELS_DIR / "coil_unetpp_effb4_last.pt"
+LAST_CHECKPOINT_PATH = MODELS_DIR / "coil_unetpp_effb4_scratch_v7_last.pt"

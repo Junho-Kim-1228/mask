@@ -15,6 +15,7 @@ class PostprocessConfig:
     min_component_area: int = config_ai.MIN_COMPONENT_AREA
     morph_open_kernel: int = config_ai.MORPH_OPEN_KERNEL
     morph_close_kernel: int = config_ai.MORPH_CLOSE_KERNEL
+    outer_recover_kernel: int = config_ai.OUTER_RECOVER_KERNEL
     keep_largest_component: bool = config_ai.KEEP_LARGEST_COMPONENT
     preserve_inner_holes: bool = config_ai.PRESERVE_INNER_HOLES
     min_hole_area: int = config_ai.MIN_HOLE_AREA
@@ -101,6 +102,14 @@ def apply_conservative_morphology(mask: np.ndarray, open_kernel: int, close_kern
     return out
 
 
+def apply_outer_recover(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    kernel_size = normalize_kernel_size(kernel_size)
+    if kernel_size <= 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(mask, kernel, iterations=1)
+
+
 def postprocess_probability_map(probability_map: np.ndarray, config: PostprocessConfig) -> np.ndarray:
     score = compute_prediction_score(probability_map)
     if score < config.confidence_threshold:
@@ -118,6 +127,10 @@ def postprocess_probability_map(probability_map: np.ndarray, config: Postprocess
     out = remove_small_components(out, config.min_component_area)
     if config.keep_largest_component and np.any(out):
         out = keep_largest_component(out)
+    if config.outer_recover_kernel > 0 and np.any(out):
+        out = apply_outer_recover(out, config.outer_recover_kernel)
+        if config.keep_largest_component:
+            out = keep_largest_component(out)
     if config.preserve_inner_holes and np.any(preserved_holes):
         out[preserved_holes > 0] = 0
     return out
