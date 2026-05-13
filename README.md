@@ -1,82 +1,207 @@
 # mask_project
 
-PCB 이미지에서 **코일 영역만 정확하게 분리**하기 위해 만든 프로젝트다.  
-초기에는 OpenCV 기반 규칙형 전처리로 시작했고, 이후 **U-Net++ + EfficientNet-B4** 기반 AI segmentation 파이프라인으로 확장했다.
+프로젝트 전체 개요, 시도한 방법, 파일 역할, 전체 사용 흐름을 정리한 메인 문서다.
 
-이 프로젝트의 핵심은 단순 배경 제거가 아니라 다음 조건을 만족하는 것이다.
+PCB 원본 이미지에서 **코일 영역만 분리**하기 위한 프로젝트다.  
+출발점은 OpenCV 규칙 기반 마스크 생성기였고, 현재는 **U-Net++ + EfficientNet-B4** 기반 AI segmentation 파이프라인까지 포함한다.
+
+이 프로젝트의 핵심 목표는 단순 배경 제거가 아니다.
 
 - 코일만 남길 것
-- 다른 부품, 밝은 부품, 회색 부품은 제거할 것
+- 다른 부품, 회색/밝은 부품, 배경은 제거할 것
 - 코일 내부 홀은 유지할 것
-- 홀 안쪽으로 튀어나온 실제 코일 형상은 최대한 보존할 것
+- 경계선 불량, 찍힘, 풀림 같은 실제 형상 정보는 최대한 보존할 것
 
----
+## 1. 현재 결론
 
-## 1. 프로젝트 개요
+현재 기준으로 프로젝트에서 실제로 쓰는 방향은 아래다.
+
+- 초기 라벨 초안은 규칙 기반 baseline으로 만든다
+- CVAT에서 사람이 수정한 데이터셋을 기준으로 AI segmentation 모델을 반복 학습한다
+- 학습된 모델로 raw 이미지를 프리라벨링하거나, 코일만 남긴 masked image를 만든다
+- 완벽한 segmentation 미관보다 **불량 보존**을 우선한다
+
+현재 실험상 가장 많이 쓰는 추론 설정은 다음과 같다.
+
+- 모델: `models/coil_unetpp_effb4_scratch_v8_best.pt`
+- 입력 크기: `512`
+- `mask-threshold`: `0.30`
+- `min-component-area`: `64`
+- `outer-recover-kernel`: `0`
+
+이 설정을 쓰는 이유는 다음과 같다.
+
+- 경계를 너무 엄격하게 자르면 실제 결함이 같이 사라진다
+- threshold `0.50`보다 `0.30`에서 검정 불량과 경계가 더 잘 살아남았다
+- 반대로 recover나 shift 같은 후처리 트릭은 근본 해결이 아니었다
+
+## 2. 프로젝트 요약
 
 ### 문제 정의
+
 - 입력: PCB 원본 이미지
-- 출력: 코일만 분리된 마스크 또는 코일 전용 annotation dataset
-- 목적: CVAT 기반 라벨링 효율화 + AI segmentation 모델 학습 + 대량 프리라벨링
+- 출력 1: CVAT용 segmentation dataset
+- 출력 2: 코일만 남긴 masked image
+- 목적: 라벨링 효율화, segmentation 모델 학습, 대량 프리라벨링, 후속 anomaly 검사용 입력 생성
 
-### 현재 구조
-- **Baseline 단계**: 규칙 기반 마스크 생성으로 초기 라벨링 초안 확보
-- **AI 단계**: 사람이 수정한 정답셋으로 U-Net++ 모델 학습
-- **반복 단계**: 학습된 모델로 대량 프리라벨링 -> CVAT 수정 -> 재학습
+### 현재 접근법
 
-### 최근 학습 결과
-- 2차 학습(`1.0ds + 2.1ds`) 기준
-- `best_val_dice = 0.9852`
+프로젝트는 아래 3단계로 운영한다.
 
-이 수치는 최종 정답 품질을 보장하는 값은 아니지만, **대량 프리라벨링용 모델로는 충분히 실용적인 상태**라는 판단 기준으로 사용했다.
+1. 규칙 기반 baseline으로 초기 마스크 초안 확보
+2. CVAT 수정본으로 AI segmentation 모델 학습
+3. 학습된 모델로 대량 프리라벨링 후 다시 CVAT 수정, 재학습 반복
 
----
+### 왜 이렇게 구성했는가
 
-## 2. 전체 프로세스
+처음부터 전부 수작업 라벨링하면 비용이 너무 크다.  
+그래서
 
-이 프로젝트는 아래 순서로 운영했다.
+- baseline 초안
+- 소량 수작업 수정
+- 1차 모델 학습
+- 대량 프리라벨
+- 추가 수정
 
-### 단계 A. 규칙 기반 Baseline으로 초기 마스크 초안 생성
-1. 원본 이미지를 `data/`에 넣는다.
-2. `src/process_all.py`로 코일 마스크를 생성한다.
-3. 결과를 CVAT가 읽을 수 있는 VOC-style segmentation 구조로 저장한다.
-4. 이를 CVAT에서 열어 사람이 직접 수정한다.
-5. 수정 완료본을 `1.0ds/`로 보관한다.
+의 반복형 구조로 바꿨다.
 
-### 단계 B. 1차 AI 학습
-1. `1.0ds/`를 train/val 구조로 나눈다.
-2. `src/train_ai.py`로 U-Net++ 모델을 학습한다.
-3. 학습된 모델(`models/coil_unetpp_effb4_best.pt`)을 사용해 raw 이미지 50장을 프리라벨링한다.
-4. CVAT에서 수정 완료본을 `2.1ds/`로 저장한다.
+## 3. 지금까지 실제로 시도한 방법
 
-### 단계 C. 2차 AI 학습
-1. `1.0ds/`와 `2.1ds/`를 합쳐서 다시 train/val split을 만든다.
-2. 같은 모델을 다시 학습한다.
-3. 개선된 best 모델로 대량 raw 이미지 세트를 프리라벨링한다.
-4. 현재는 `3.0ds/` 형태로 결과를 생성해서 다시 CVAT 수정에 투입할 수 있다.
+### 3-1. 규칙 기반 baseline
 
-즉 이 프로젝트는 **한 번에 정답을 만드는 방식이 아니라, 라벨링과 모델 학습을 반복하면서 품질을 끌어올리는 구조**다.
+초기에는 `src/process_all.py`를 사용했다.
 
----
+핵심 아이디어:
 
-## 3. 디렉터리 구조
+- edge / texture 기반 후보 추출
+- morphology
+- contour
+- adaptive color gate
+- 내부 홀 유지
 
-현재 repo에서 자주 쓰는 주요 폴더는 아래와 같다.
+장점:
+
+- 라벨링 초안 생성 속도가 빠름
+- 데이터셋이 전혀 없을 때 출발점으로 유용함
+
+한계:
+
+- 이미지별 색/조명 변화에 취약
+- 경계가 조금씩 깎이거나 남는 편향이 생김
+- 검정색 결함이나 색이 다른 불량에 약함
+
+### 3-2. 1차 AI 모델
+
+초기 AI 모델은 `U-Net++ + EfficientNet-B4`로 시작했다.
+
+기본 방향:
+
+- binary segmentation
+- `background / coil`
+- supervised learning
+
+초기에는 `BCE + Dice` 계열로 학습했지만, 다음 문제가 남았다.
+
+- 경계를 조금 덜 잡아도 metric이 크게 안 떨어짐
+- 검정색 찍힘/불량은 잘 놓침
+- 전체 dice는 높아도 실제 불량 보존이 아쉬움
+
+### 3-3. 경계 보존용 보강셋
+
+경계가 잘리는 문제를 줄이기 위해 `3.2ds`를 따로 만들었다.
+
+의도:
+
+- 풀림, 얇은 경계, 외곽이 잘리던 샘플 보강
+
+이후 시도:
+
+- 추가 라벨셋 병합
+- fine-tune
+- scratch 재학습 비교
+
+결론:
+
+- 경계 보강 자체는 의미가 있었지만
+- 검정 불량/색 다른 불량까지 자동으로 해결되지는 않았다
+
+### 3-4. 색이 다른 불량 보강셋
+
+검정색 찍힘, 색이 다른 불량을 보강하기 위해 `4.2ds`를 만들었다.
+
+이 데이터셋의 의미:
+
+- segmentation이 일반적인 코일 색만 배우지 않도록
+- “이상한 색이지만 코일로 남겨야 하는 부분”을 강하게 보여주는 hard case 세트
+
+### 3-5. Fine-tune vs Scratch
+
+둘 다 실제로 실험했다.
+
+- 기존 best 모델 기준 fine-tune
+- 새 체크포인트 이름으로 scratch 재학습
+
+관찰:
+
+- metric만 보면 기존 fine-tune 쪽이 좋을 때도 있었다
+- 하지만 시각적으로는 scratch 쪽이 더 자연스러운 경우가 있었다
+
+즉 이 프로젝트는 metric 숫자만으로 모델을 선택하지 않고,
+
+- 경계 보존
+- 검정 불량 보존
+- 배경 유입 정도
+
+를 같이 본다.
+
+### 3-6. Threshold, recover, shift 실험
+
+경계가 잘리는 문제를 줄이기 위해 아래도 실험했다.
+
+- `mask-threshold` 하향
+- `outer-recover-kernel`
+- `mask shift`
+- refine crop 2단계 추론
+
+현재 판단:
+
+- `mask-threshold` 조정은 실제로 영향이 컸다
+- `outer-recover-kernel`은 보조적
+- `mask shift`는 디버그용일 뿐, 근본 해결은 아님
+- refine crop은 내부적으로만 의미가 있고, 최종 전략의 핵심은 아님
+
+### 3-7. 현재 학습 전략
+
+최근에는 hard case에 더 민감하게 반응하도록 학습 로직을 바꿨다.
+
+현재 반영된 것:
+
+- `BoundaryWeighted BCE + Focal Tversky`
+- `4.2ds` oversampling
+- `4.2ds` 일부를 hard validation으로 고정
+- `focus_val_tversky` 기준 best checkpoint 선택
+- 20 epoch마다 중간 checkpoint 저장
+
+즉 지금은 단순 `val_dice`가 아니라,  
+실제로 놓치기 쉬운 hard case에서 잘 버티는 모델을 뽑는 방향으로 바뀌었다.
+
+## 4. 현재 폴더 구조
+
+현재 repo에서 실사용 기준으로 중요한 폴더는 아래다.
 
 ```text
 mask_project/
-├─ data/                    # 초기 baseline 마스크 생성을 위한 원본 이미지
+├─ data/                    # baseline 초기 마스크 생성용 원본 이미지
 ├─ dataset/                 # 현재 프리라벨 대상 raw 이미지 풀
-├─ 1.0ds/                   # CVAT에서 수정 완료한 1차 정답셋
+├─ 1.0ds/                   # 1차 수동 수정 완료 정답셋
 ├─ 2.1ds/                   # 2차 수정 완료 정답셋
-├─ 3.0ds/                   # 현재 best 모델로 프리라벨링한 대량 결과셋
-├─ prepared_1.0ds/          # 1.0ds를 train/val로 나눈 학습용 구조
-├─ prepared_trainset/       # 1.0ds + 2.1ds를 합친 재학습용 구조
+├─ 3.2ds/                   # 경계 보강용 수정 완료 정답셋
+├─ 4.2ds/                   # 검정/색 다른 불량 보강용 수정 완료 정답셋
 ├─ models/
-│  ├─ coil_unetpp_effb4_best.pt
-│  └─ coil_unetpp_effb4_last.pt
+│  ├─ .gitkeep
+│  └─ coil_unetpp_effb4_scratch_v8_best.pt
 ├─ output/
-│  └─ coil_only/            # baseline이 코일만 남긴 BMP 결과를 저장하는 폴더
+│  └─ coil_only_ai/         # AI masked image 저장 위치
 ├─ src/
 │  ├─ process_all.py
 │  ├─ trackbar.py
@@ -88,6 +213,7 @@ mask_project/
 │  ├─ train_ai.py
 │  ├─ prepare_cvat_dataset_ai.py
 │  ├─ prelabel_cvat_dataset_ai.py
+│  ├─ apply_ai_mask.py
 │  └─ make_cvat_zip.py
 ├─ README.md
 ├─ README_AI.md
@@ -95,259 +221,221 @@ mask_project/
 └─ requirements_ai.txt
 ```
 
-주의:
-- 이 프로젝트에서는 `dataset/` 폴더를 **두 단계에서 다른 용도**로 썼다.
-- 초기 bootstrap 단계에서는 `src/process_all.py`가 `dataset/` 아래에 CVAT용 segmentation 구조를 만들었다.
-- 그 결과를 `1.0ds/`로 정리한 뒤에는, `dataset/`를 다시 **raw 이미지 풀**로 재사용했다.
-
----
-
-## 4. 파일별 역할
+## 5. `src/` 파일 역할
 
 ### Baseline 관련
-- [`src/process_all.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/process_all.py)  
-  규칙 기반 코일 마스크 생성기.  
-  에지/텍스처, morphology, contour, adaptive color gate를 이용해 초기 마스크를 만든다.
 
-- [`src/trackbar.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/trackbar.py)  
-  baseline 파이프라인 튜닝용 GUI.  
-  `trim`, `smooth`, `내부W/H` 같은 값을 손으로 조정하면서 baseline 결과를 빠르게 확인할 때 사용한다.
+- [src/process_all.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/process_all.py)  
+  규칙 기반 초기 마스크 생성기.  
+  `data/` 원본을 읽어서 `dataset/SegmentationClass`, `dataset/SegmentationObject`에 CVAT용 마스크를 만든다.
+
+- [src/trackbar.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/trackbar.py)  
+  baseline 마스크 튜닝용 GUI.  
+  `trim`, `smooth`, 내부 홀 비율 등 rule-based 파라미터를 손으로 만질 때 사용한다.
 
 ### AI 관련
-- [`src/config_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/config_ai.py)  
-  모델 구조, 입력 크기, threshold, 경로 같은 AI 기본 설정을 모아둔 파일.
 
-- [`src/io_utils_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/io_utils_ai.py)  
-  이미지 로드, resize/pad, 디렉터리 생성, 파일 탐색 같은 공통 입출력 유틸.
+- [src/config_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/config_ai.py)  
+  AI 기본 설정 파일.  
+  모델 구조, 기본 경로, threshold, 입력 크기 등 공통 상수를 모아둔다.
 
-- [`src/segment_model.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/segment_model.py)  
-  U-Net++ + EfficientNet-B4 모델 생성, weight 로드, device 선택, 추론 래퍼.
+- [src/io_utils_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/io_utils_ai.py)  
+  이미지 로드, resize/pad, bbox 계산, crop, mask 적용, 디렉터리 생성 등 공통 유틸.
 
-- [`src/postprocess_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/postprocess_ai.py)  
-  probability map을 threshold해서 binary mask로 바꾸고,  
-  small blob 제거, conservative morphology, largest component 유지 같은 최소 후처리를 담당한다.
+- [src/segment_model.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/segment_model.py)  
+  U-Net++ + EfficientNet-B4 모델 생성, checkpoint 로드, device 선택, 추론 래퍼.
 
-- [`src/dataset_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/dataset_ai.py)  
-  PyTorch 학습용 dataset loader.  
-  이미지와 마스크 쌍을 읽고 transform을 적용한다.
+- [src/postprocess_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/postprocess_ai.py)  
+  probability map 후처리.  
+  threshold, small component 제거, morphology, largest component 유지, inner hole 보존 등을 담당한다.
 
-- [`src/train_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/train_ai.py)  
+- [src/dataset_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/dataset_ai.py)  
+  PyTorch dataset loader.  
+  현재는 색상 generalization을 위해 brightness/contrast/Hue-Saturation/ToGray augmentation도 포함한다.
+
+- [src/train_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/train_ai.py)  
   학습 엔트리포인트.  
-  `BCE + Dice` loss 기반으로 binary segmentation 모델을 학습한다.  
-  `--resume-from`으로 중단된 학습도 이어갈 수 있다.
+  oversampling, hard validation, boundary-weighted loss, 20 epoch 주기 저장까지 포함한다.
 
-- [`src/prepare_cvat_dataset_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/prepare_cvat_dataset_ai.py)  
-  `1.0ds`, `2.1ds` 같은 CVAT 완료본을 train/val 구조로 변환한다.  
-  여러 `--source-dir`를 동시에 받아서 dataset merge도 가능하다.
+- [src/prepare_cvat_dataset_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/prepare_cvat_dataset_ai.py)  
+  `1.0ds`, `2.1ds`, `3.2ds`, `4.2ds` 같은 완료본을 train/val 구조로 변환한다.  
+  여러 source를 merge할 수 있고, hard val source도 지정 가능하다.
 
-- [`src/prelabel_cvat_dataset_ai.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/prelabel_cvat_dataset_ai.py)  
-  학습된 모델로 raw 이미지 폴더를 읽어서,  
-  CVAT에 바로 import 가능한 VOC-style segmentation dataset을 생성한다.
+- [src/prelabel_cvat_dataset_ai.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/prelabel_cvat_dataset_ai.py)  
+  raw 이미지 폴더를 읽어서 CVAT용 VOC-style segmentation dataset을 생성한다.
 
-- [`src/make_cvat_zip.py`](/mnt/c/Users/wnsgh/kjhdev/mask_project/src/make_cvat_zip.py)  
-  `labelmap.txt`, `ImageSets/Segmentation/default.txt`, `SegmentationClass`, `SegmentationObject` 구조를 zip으로 묶어 CVAT 업로드 파일을 만든다.
+- [src/apply_ai_mask.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/apply_ai_mask.py)  
+  raw 이미지에 AI 마스크를 적용해서 코일만 남긴 `masked image`를 저장한다.
 
----
+- [src/make_cvat_zip.py](/mnt/c/users/wnsgh/kjhdev/mask_project/src/make_cvat_zip.py)  
+  VOC-style dataset을 CVAT 업로드용 zip으로 묶는다.
 
-## 5. 마스크 형식과 CVAT 호환성
+## 6. CVAT용 마스크 형식
 
-이 프로젝트에서 CVAT 업로드용 segmentation mask는 **1채널 index mask**를 사용한다.
+현재 CVAT용 마스크는 **1채널 index mask**를 사용한다.
 
 - 배경: `0`
 - 코일: `1`
 
-이 형식을 쓰는 이유는, 초기에 3채널 `(0,0,0)` / `(255,255,255)` 마스크를 사용했을 때 CVAT에서  
-`Undeclared color (255, 255, 255)` 오류가 발생했기 때문이다.
+이유:
 
-즉 지금은:
-- 사람이 눈으로 보면 거의 검정처럼 보일 수 있지만
-- CVAT용 annotation dataset으로는 더 안정적인 형식이다.
+- 예전 3채널 `(0,0,0)` / `(255,255,255)` 마스크는 CVAT에서  
+  `Undeclared color (255, 255, 255)` 오류가 났다
+- 1채널 index mask는 CVAT에서 훨씬 안정적으로 읽힌다
 
----
+즉 이미지 뷰어로 보면 거의 검정처럼 보여도 정상이다.
 
-## 6. 환경 설정
+## 7. 환경 준비
 
-### Conda 가상환경 활성화
+### 가상환경 활성화
+
 ```bash
 conda activate mask_vision
 ```
 
-### Baseline 의존성 설치
+### baseline 의존성
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### AI 의존성 설치
+### AI 의존성
+
 ```bash
 pip install -r requirements_ai.txt
 ```
 
-노트북 환경이라면 GPU 메모리와 발열 문제 때문에 학습 시 `input-size 512`, `batch-size 1`부터 시작하는 편이 안정적이다.
+노트북 환경에서는 GPU 메모리/발열 때문에 보통 아래를 권장한다.
 
----
+- `input-size 512`
+- `batch-size 1`
 
-## 7. 사용 방법
+## 8. 사용법
 
-### 7-1. 초기 baseline 마스크 생성
+### 8-1. 초기 baseline 마스크 생성
 
-`data/`에 원본 이미지를 넣고 실행:
+`data/`에 원본 이미지를 넣고:
 
 ```bash
 python src/process_all.py
 ```
 
-이 스크립트는 다음 용도로 사용한다.
-- baseline 규칙 기반 마스크 생성
-- 초기 CVAT 수정용 초안 확보
-- 코일만 남긴 BMP 결과 저장
-- CVAT용 index mask를 `dataset/SegmentationClass`, `dataset/SegmentationObject`에 저장
+결과:
 
-주의:
-- 이 단계는 **초기 bootstrap용**이다.
-- 이후 AI 반복 단계에서는 주로 `1.0ds`, `2.1ds`, `dataset/`, `3.0ds` 흐름을 사용한다.
+- `dataset/SegmentationClass/*.png`
+- `dataset/SegmentationObject/*.png`
+- `dataset/ImageSets/Segmentation/default.txt`
 
-### 7-2. CVAT 업로드용 zip 생성
+용도:
 
-VOC-style dataset 폴더를 zip으로 묶을 때:
+- 초기 CVAT 수정용 bootstrap mask 생성
+
+### 8-2. CVAT 업로드용 zip 만들기
 
 ```bash
 python src/make_cvat_zip.py --dataset-dir 1.0ds --output-zip 1.0ds_for_cvat.zip
 ```
 
-또는:
+예시:
 
 ```bash
-python src/make_cvat_zip.py --dataset-dir 3.0ds --output-zip 3.0ds_for_cvat.zip
+python src/make_cvat_zip.py --dataset-dir 4.2ds --output-zip 4.2ds_for_cvat.zip
 ```
 
----
+### 8-3. 완료본 데이터셋을 train/val로 변환
 
-## 8. 학습 파이프라인
-
-### 8-1. 1차 라벨링 데이터 준비
-
-`1.0ds/`를 train/val 구조로 변환:
+단일 source:
 
 ```bash
 python src/prepare_cvat_dataset_ai.py --source-dir 1.0ds --output-dir prepared_1.0ds --val-ratio 0.2 --overwrite
 ```
 
-생성 결과:
-
-```text
-prepared_1.0ds/
-├─ train/
-│  ├─ images/
-│  └─ masks/
-└─ val/
-   ├─ images/
-   └─ masks/
-```
-
-### 8-2. 1차 모델 학습
+여러 source merge:
 
 ```bash
-python src/train_ai.py --train-images-dir prepared_1.0ds/train/images --train-masks-dir prepared_1.0ds/train/masks --val-images-dir prepared_1.0ds/val/images --val-masks-dir prepared_1.0ds/val/masks --checkpoint-path models/coil_unetpp_effb4_best.pt --last-checkpoint-path models/coil_unetpp_effb4_last.pt --input-size 512 --batch-size 1 --epochs 40 --device auto
+python src/prepare_cvat_dataset_ai.py --source-dir 1.0ds --source-dir 2.1ds --source-dir 3.2ds --source-dir 4.2ds --output-dir prepared_trainset_v8 --val-ratio 0.2 --hard-val-source 4.2ds --hard-val-count 5 --overwrite
 ```
 
-### 8-3. 학습 중단 후 이어서 학습
+의미:
+
+- `4.2ds`에서 5장을 hard validation에 강제로 포함
+
+### 8-4. 현재 권장 재학습 명령어
+
+현재 hard case 대응용 학습 설정 예시는 이렇다.
 
 ```bash
-python src/train_ai.py --train-images-dir prepared_1.0ds/train/images --train-masks-dir prepared_1.0ds/train/masks --val-images-dir prepared_1.0ds/val/images --val-masks-dir prepared_1.0ds/val/masks --checkpoint-path models/coil_unetpp_effb4_best.pt --last-checkpoint-path models/coil_unetpp_effb4_last.pt --resume-from models/coil_unetpp_effb4_last.pt --input-size 512 --batch-size 1 --epochs 40 --device auto
+python src/train_ai.py --train-images-dir prepared_trainset_v8/train/images --train-masks-dir prepared_trainset_v8/train/masks --val-images-dir prepared_trainset_v8/val/images --val-masks-dir prepared_trainset_v8/val/masks --checkpoint-path models/coil_unetpp_effb4_scratch_v8_best.pt --last-checkpoint-path models/coil_unetpp_effb4_scratch_v8_last.pt --input-size 512 --batch-size 1 --epochs 80 --lr 1e-4 --device auto --oversample-source 4.2ds --oversample-factor 16.0 --tversky-alpha 0.20 --tversky-beta 0.80 --focal-gamma 1.5 --boundary-weight 3.0 --focus-val-source 4.2ds --best-metric focus_val_tversky --save-every 20
 ```
 
-### 8-4. 2차 학습용 dataset merge
+이 명령어의 핵심:
 
-`1.0ds`와 `2.1ds`를 합쳐서 재학습용 split 생성:
+- `4.2ds`를 16배 oversampling
+- `4.2ds` 일부를 val에서도 직접 확인
+- `focus_val_tversky` 기준으로 best checkpoint 선택
+- `20/40/60/80` epoch checkpoint 저장
+
+### 8-5. raw 이미지 프리라벨링
+
+현재 권장 모델/설정:
 
 ```bash
-python src/prepare_cvat_dataset_ai.py --source-dir 1.0ds --source-dir 2.1ds --output-dir prepared_trainset --val-ratio 0.2 --overwrite
+python src/prelabel_cvat_dataset_ai.py --input-dir dataset --output-dir 4.3ds --model-path models/coil_unetpp_effb4_scratch_v8_best.pt --device auto --input-size 512 --mask-threshold 0.30 --min-component-area 64 --outer-recover-kernel 0 --overwrite
 ```
 
-### 8-5. 2차 모델 학습
+설명:
+
+- `dataset/` 원본 raw 이미지를 읽는다
+- `4.3ds/`에 CVAT 업로드 가능한 segmentation dataset을 만든다
+- 현재 실험상 `mask-threshold 0.30`이 검정 불량과 경계를 제일 잘 살렸다
+
+### 8-6. 코일만 남긴 masked image 생성
 
 ```bash
-python src/train_ai.py --train-images-dir prepared_trainset/train/images --train-masks-dir prepared_trainset/train/masks --val-images-dir prepared_trainset/val/images --val-masks-dir prepared_trainset/val/masks --checkpoint-path models/coil_unetpp_effb4_best.pt --last-checkpoint-path models/coil_unetpp_effb4_last.pt --input-size 512 --batch-size 1 --epochs 40 --device auto
+python src/apply_ai_mask.py --input-dir dataset --output-dir output/coil_only_ai --model-path models/coil_unetpp_effb4_scratch_v8_best.pt --device auto --input-size 512 --mask-threshold 0.30 --min-component-area 64 --outer-recover-kernel 0 --overwrite
 ```
 
----
+이 결과는 보통 이렇게 부른다.
 
-## 9. 대량 프리라벨링
+- `masked image`
+- `foreground-only image`
+- `mask applied result`
 
-### 9-1. raw 이미지 50장 프리라벨링
+즉 라벨링용 mask PNG와는 다르고,  
+원본에서 코일만 남기고 나머지를 검정으로 날린 전처리 결과다.
 
-`dataset/`에 raw 이미지 50장을 넣은 뒤:
+## 9. 모델 선택 기준
 
-```bash
-python src/prelabel_cvat_dataset_ai.py --input-dir dataset --output-dir 2.0ds --model-path models/coil_unetpp_effb4_best.pt --device auto --input-size 512
-```
+이 프로젝트에서는 모델을 숫자 하나만 보고 고르지 않는다.
 
-이후 CVAT에서 수정 완료한 결과를 `2.1ds/`로 관리한다.
+같이 보는 기준:
 
-### 9-2. 대량 raw 이미지 프리라벨링
+- `val_dice`
+- `val_tversky`
+- hard case(`4.2ds`)에서의 `focus_val_tversky`
+- 실제 CVAT 프리라벨 결과
+- 경계가 과하게 잘리지 않는지
+- 검정 불량을 살리는지
+- 배경이 과하게 들어오지 않는지
 
-현재 best 모델로 raw 이미지 대량 세트를 프리라벨링:
+즉 metric은 참고용이고, 최종 판단은 실제 샘플 비교까지 포함한다.
 
-```bash
-python src/prelabel_cvat_dataset_ai.py --input-dir dataset --output-dir 3.0ds --model-path models/coil_unetpp_effb4_best.pt --device auto --input-size 512 --overwrite
-```
+## 10. 현재 프로젝트에서 배운 점
 
-생성 결과:
+이 프로젝트에서 중요했던 건 단순히 segmentation 점수를 높이는 게 아니었다.
 
-```text
-3.0ds/
-├─ labelmap.txt
-├─ JPEGImages/
-├─ SegmentationClass/
-├─ SegmentationObject/
-└─ ImageSets/Segmentation/default.txt
-```
+실제로는 다음이 더 중요했다.
 
-CVAT 업로드 zip 생성:
+- 경계를 조금 덜 잡아도 metric은 잘 나올 수 있다
+- 검정색 불량은 segmentation이 그냥 배경으로 무시해버릴 수 있다
+- 라벨 보강셋(`3.2ds`, `4.2ds`)은 실제 모델 편향을 교정하는 데 매우 중요하다
+- 후처리 트릭보다, hard case를 학습과 validation에 직접 반영하는 게 더 효과적이다
 
-```bash
-python src/make_cvat_zip.py --dataset-dir 3.0ds --output-zip 3.0ds_for_cvat.zip
-```
+즉 이 프로젝트는 단순한 segmentation 예제가 아니라,
 
----
+- 라벨링 반복
+- hard case 수집
+- metric과 실제 샘플 비교
+- 모델 선택 기준 재설계
 
-## 10. 이 프로젝트에서 중요한 설계 원칙
-
-- baseline과 AI 파이프라인을 섞지 않는다.
-- 초기 라벨링 비용을 줄이기 위해 baseline을 **bootstrap 도구**로 사용한다.
-- AI 모델은 바로 최종 정답을 만드는 용도가 아니라 **프리라벨링 가속기**로 사용한다.
-- 후처리는 최소화하고, 실제 코일 형상 보존을 우선한다.
-- 내부 홀은 유지한다.
-- morphology로 억지로 예쁜 모양을 만드는 것을 피한다.
-
----
-
-## 11. 포트폴리오 관점에서의 의미
-
-이 프로젝트는 단순한 이미지 전처리 스크립트가 아니라, 실제 현업형 annotation workflow를 설계하고 구현한 사례다.
-
-핵심 포인트:
-- 규칙 기반 baseline 구축
-- CVAT 호환 segmentation dataset 구조 설계
-- 1채널 index mask 기반 import 오류 해결
-- U-Net++ + EfficientNet-B4 기반 binary segmentation 학습 파이프라인 구축
-- 소량 수작업 라벨 -> AI 프리라벨 -> 사람 수정 -> 재학습의 **iterative labeling loop** 구현
-- 노트북 GPU 환경에서 안정적으로 돌릴 수 있도록 `input-size`, `batch-size`, resume 전략까지 정리
-
-즉 이 프로젝트의 가치는 단순히 “마스크를 잘 뽑았다”가 아니라,  
-**라벨링 비용을 줄이고 데이터셋을 점진적으로 확장할 수 있는 운영형 파이프라인을 만들었다는 점**에 있다.
-
----
-
-## 12. 주의사항
-
-- `input-size 768`, `batch-size 2`는 노트북 GPU 환경에서 무거울 수 있다.
-- 학습 중 노트북 전체가 꺼진다면, 파이썬 에러보다 **발열 / 전원 / 드라이버 리셋** 문제일 가능성이 크다.
-- 이 경우 아래 설정이 더 안정적이다:
-
-```bash
---input-size 512 --batch-size 1
-```
-
-- CVAT용 index mask는 일반 이미지 뷰어에서 거의 검정처럼 보일 수 있다.  
-  이것은 오류가 아니라 **0/1 index mask의 정상적인 표시 방식**이다.
+까지 포함한 **현실적인 비전 데이터 엔지니어링/모델링 프로젝트**에 가깝다.
